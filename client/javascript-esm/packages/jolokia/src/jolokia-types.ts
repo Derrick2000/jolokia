@@ -169,6 +169,11 @@ export type JolokiaConfiguration = BaseRequestOptions & {
    * Interval for poll-fetching (in ms) that can be changed during {@link IJolokia#start}
    */
   fetchInterval?: number
+  /**
+   * Fetch API error callback configured for all `request()` calls of this instance. Can be used both for promise
+   * and callback modes
+   */
+  fetchError?: "ignore" | FetchErrorCallback
 }
 
 /**
@@ -182,7 +187,7 @@ export type RequestOptions = BaseRequestOptions & {
    * A hint about the value we want the returned promise to resolve to. `default` (or when not specified) means
    * a promise resolving to an array of Jolokia (good and error) responses is returned. Also, when `dataType=text`
    * this promise resolves to a string value for the response.
-   * When specifying `response`, we're returning a Fetch API response directly, so user may do whatever is needed.
+   * When specifying `response`, we're returning a Fetch API Response object directly, so user may do whatever is needed.
    */
   resolve?: "default" | "response"
   /**
@@ -195,6 +200,10 @@ export type RequestOptions = BaseRequestOptions & {
    * to be used by {@link IJolokia#request} method for error response
    */
   error?: "ignore" | ErrorCallback | ErrorCallbacks
+  /**
+   * Fetch API error callback configured for single `request()` call. Can be used both in callback and in promise modes.
+   */
+  fetchError?: "ignore" | FetchErrorCallback
 }
 
 // --- Types related to Jolokia requests
@@ -395,7 +404,7 @@ export type JolokiaSuccessResponse = JolokiaResponse & {
   /** Original request for this response */
   request: JolokiaRequest
   /** Value returned for the request. Can be null for WriteRequest, but still the value should be available */
-  value: string | number | JolokiaResponseValue | null
+  value: string | number | boolean | JolokiaResponseValue | null
   /** History of previous responses for given reques (if History interceptor is available) */
   history?: JolokiaResponse
 }
@@ -435,21 +444,21 @@ export type JolokiaResponseValue =
 /**
  * Generic response value for `read` request
  */
-export type ReadResponseValue = string | number | null | Record<string, unknown>
+export type ReadResponseValue = string | number | boolean | null | Record<string, unknown>
 
 // ------ Write response
 
 /**
  * Generic response value for `write` request
  */
-export type WriteResponseValue = string | number | null | Record<string, unknown>
+export type WriteResponseValue = string | number | boolean | null | Record<string, unknown>
 
 // ------ Exec response
 
 /**
  * Generic response value for `write` request
  */
-export type ExecResponseValue = string | number | null | Record<string, unknown>
+export type ExecResponseValue = string | number | boolean | null | Record<string, unknown>
 
 // ------ Search response
 
@@ -529,23 +538,48 @@ export type AgentInfo = {
 //          }
 
 /**
- * All possible (and worth mentioning) `list` response valies depending on the `path` parameters.
+ * All possible (and worth mentioning) `list` response values depending on the `path` parameters.
  */
-export type ListResponseValue = JmxDomains | JmxDomain | MBeanInfo | MBeanInfoError | null
+export type ListResponseValue =
+  | OptimizedJmxDomains
+  | JmxDomains
+  | JmxDomain
+  | MBeanInfo
+  | MBeanInfoError
+  | null
 
 /**
- * Full JMX tree of domains, mbeans, attributes/operations/notifications with details
+ * Full JMX tree of domains in new optimized structure. Without optimizations we have top-level {@link JmxDomains}
+ * type which in optimized mode is moved under `domains` key and single key of {@link JmxDomain} may be a string key
+ * to select cached {@link MBeanInfo} under `cache` key.
+ */
+export type OptimizedJmxDomains = {
+  /** a record of cache-key -> cached-MBeanInfo object which may be referred to from some jmx domain objects */
+  cache: Record<string, MBeanInfo>
+  /** a map of domain -> MBean -> MBeanInfo, where MBeanInfo may be just a key to cached value from `cache` */
+  domains: JmxDomains
+}
+
+/**
+ * Full JMX tree of domains, mbeans, attributes/operations/notifications with details. The key is domain name.
  */
 export type JmxDomains = Record<string, JmxDomain>
 
 /**
- * Single JMX domain with details about
+ * Single JMX domain with details about. The key is a list of key-value properties of MBean ObjectName, so
+ * together with parent domain it give full ObjectName.
+ *
+ * This string value is dual-purpose:
+ * * With small enough `maxDepth`, we may end up just with "1" as the info (the way Jolokia trims the depth
+ *   of responses) - that'w why it may be a string.
+ * * With `listCache=true`, some domains instead of full MBeanInfo value may point to the cached value using
+ *   string _key_
  */
-export type JmxDomain = Record<string, MBeanInfo | MBeanInfoError> | string
+export type JmxDomain = Record<string, MBeanInfo | MBeanInfoError | string>
 
 /**
- * Information about single MBean. With small enough `maxDepth`, we may end up just with mbean count within domain
- * (that'w why it may be string)
+ * Information about single MBean. Thanks to `org.jolokia.service.jmx.handler.list.DataUpdater` services, the
+ * list of fields for MBeanInfo is extensible (for example RBAC information can be added).
  */
 export type MBeanInfo = {
   /** MBean description */
@@ -558,7 +592,7 @@ export type MBeanInfo = {
   op?: Record<string, MBeanOperation | MBeanOperation[]>
   /** Map of notification definitions */
   notif?: Record<string, MBeanNotification>
-} | string
+}
 
 /**
  * Information about single MBean in case there's a problem getting such information
@@ -730,6 +764,26 @@ export type ErrorCallback = (response: JolokiaErrorResponse, index: number) => v
 export type ErrorCallbacks = ((response: JolokiaErrorResponse, index: number) => void)[]
 
 /**
+ * A callback used in `fetch().catch()` when `success` and `error` callbacks are passed (callback-mode). In promise
+ * mode, user may attach `.catch()` to the returned promise explicitly (or face an exception).
+ * See <a href="https://developer.mozilla.org/en-US/docs/Web/API/Window/fetch#exceptions">Fetch Exceptions</a>.
+ *
+ * This callback _should_ be used in _callback mode_, where `success` (and possibly `error`) callbacks are passed
+ * and user is not interested in returned Promise. There are two kinds of _errors_ when using `fetch()`:
+ * * HTTP != 200 errors (jquery uses `status >= 200 && status < 300 || status === 304`)
+ * * networking/configuration errors (for example when bad header is set or `get` is used with non-empty body)
+ *
+ * This callback _may_ be used in _promise mode_ as well, so the returned promise has a `.catch()` block attached
+ * invoking the passed callback.
+ *
+ * networking errors are thrown by `fetch()`, but HTTP errors are passed in returned async `Response` object.
+ *
+ * From Jolokia perspective this callback is used in `Jolokia.request()`, not in lower-level `fetch()`, so we handle
+ * both errors in the same way.
+ */
+export type FetchErrorCallback = (response: Response | null, error: DOMException | TypeError | string | null) => void
+
+/**
  * A response callback used for registered jobs called periodically. In addition to standard {@link ResponseCallback},
  * this method receives registered job ID as 2nd argument and index of the response is passed as 3rd argument.
  * Only JSON responses are handled.
@@ -832,16 +886,47 @@ export type NotificationHandle = {
 
 // --- Jolokia interfaces - public API
 
+/**
+ * IJolokia creation interface - either using `new` or using function call syntax.
+ */
 interface JolokiaStatic {
-  (config: JolokiaConfiguration | string): undefined
+  /** Creating {@link IJolokia} using function call syntax */
+  (config: JolokiaConfiguration | string): IJolokia
 
+  /** Creating {@link IJolokia} using object creation syntax with `new` */
   new(config: JolokiaConfiguration | string): IJolokia
+
+  // --- Utility functions available statically (static methods) and in Jolokia.prototype (instance methods)
+  //     (that's why these need to be duplicated in JolokiaStatic and in IJolokia interfaces)
+
+  /**
+   * Escape URL part (segment) according to
+   * {@link https://jolokia.org/reference/html/manual/jolokia_protocol.html#_escaping_rules_in_get_requests Jolokia escaping rules}
+   * @param part An URL segment for Jolokia GET URL
+   * @returns URL segment with Jolokia escaping rules applied
+   */
+  escape(part: string): string
+
+  /**
+   * Escape URL part (segment) according to
+   * {@link https://jolokia.org/reference/html/manual/jolokia_protocol.html#_escaping_rules_in_get_requests Jolokia escaping rules}
+   * @param part a path used with POST requests
+   * @returns URL segment with Jolokia escaping rules applied
+   */
+  escapePost(part: string): string
+
+  /**
+   * Utility method which checks whether a response is an error or a success (from Jolokia, not HTTP perspective)
+   * @param resp response to check
+   * @return true if response is an error, false otherwise
+   */
+  isError(resp: JolokiaResponse): resp is JolokiaErrorResponse
 }
 
 /**
  * Main Jolokia client interface for communication with remote Jolokia agent.
  */
-interface IJolokia extends JolokiaStatic {
+interface IJolokia {
 
   /** Version of Jolokia JavaScript client library */
   readonly CLIENT_VERSION: string
@@ -955,7 +1040,8 @@ interface IJolokia extends JolokiaStatic {
    */
   unregisterNotificationClient(): Promise<boolean>
 
-  // --- Utility functions available statically and in Jolokia.prototype (instance methods)
+  // --- Utility functions available statically (static methods) and in Jolokia.prototype (instance methods)
+  //     (that's why these need to be duplicated in JolokiaStatic and in IJolokia interfaces)
 
   /**
    * Escape URL part (segment) according to
@@ -978,7 +1064,7 @@ interface IJolokia extends JolokiaStatic {
    * @param resp response to check
    * @return true if response is an error, false otherwise
    */
-  isError(resp: JolokiaResponse): boolean
+  isError(resp: JolokiaResponse): resp is JolokiaErrorResponse
 }
 
 export type { IJolokia, JolokiaStatic }

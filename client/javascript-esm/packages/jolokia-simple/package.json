@@ -1,6 +1,6 @@
 {
   "name": "@jolokia.js/simple",
-  "version": "2.1.2",
+  "version": "2.1.7",
   "description": "Jolokia JavaScript ES Simple module",
   "type": "module",
   "repository": {
@@ -20,7 +20,7 @@
     ".": {
       "types": "./dist/dts/jolokia-simple.d.ts",
       "import": "./dist/jolokia-simple.mjs",
-      "default": "./src/jolokia-simple.ts"
+      "default": "./dist/jolokia-simple.cjs"
     }
   },
   "scripts": {
@@ -35,7 +35,7 @@
     "@rollup/plugin-node-resolve": "^15.2.3",
     "@rollup/plugin-terser": "^0.4.4",
     "jest": "^29.7.0",
-    "rollup": "^4.20.0"
+    "rollup": "^4.22.4"
   },
   "publishConfig": {
     "access": "public"

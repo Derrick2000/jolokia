@@ -19,6 +19,7 @@ import {
   ErrorCallback,
   ErrorCallbacks,
   ExecRequest,
+  FetchErrorCallback,
   GenericCallback,
   GenericRequest,
   IJolokia,
@@ -29,8 +30,10 @@ import {
   JolokiaErrorResponse,
   JolokiaRequest,
   JolokiaResponse,
+  JolokiaStatic,
   JolokiaSuccessResponse,
-  ListRequest, NotificationAddResponseValue,
+  ListRequest,
+  NotificationAddResponseValue,
   NotificationHandle,
   NotificationMode,
   NotificationOptions,
@@ -60,9 +63,10 @@ type RequestArguments = {
   resolve?: "default" | "response"
   successCb?: ResponseCallback | TextResponseCallback | ErrorCallback
   errorCb?: ResponseCallback | TextResponseCallback | ErrorCallback
+  fetchErrorCb?: FetchErrorCallback
 }
 
-const CLIENT_VERSION = "2.1.2"
+const CLIENT_VERSION = "2.1.7"
 
 /**
  * Default parameters for GET and POST requests
@@ -98,7 +102,7 @@ const PROCESSING_PARAMS: string[] = [
 const Jolokia = function (this: IJolokia, config: JolokiaConfiguration | string): IJolokia | undefined {
   if (!new.target) {
     // when invoked as function, return properly created object with bound "this" reference
-    return new (Jolokia as IJolokia)(config)
+    return new (Jolokia as JolokiaStatic)(config) as IJolokia
   }
 
   // ++++++++++++++++++++++++++++++++++++++++++++++++++
@@ -253,10 +257,10 @@ const Jolokia = function (this: IJolokia, config: JolokiaConfiguration | string)
         const resp = responses as JolokiaSuccessResponse | JolokiaErrorResponse
         if (Jolokia.isError(resp)) {
           throw new Error("Cannot not add notification subscription for " + opts.mbean +
-            " (client: " + client.id + "): " + (resp as JolokiaErrorResponse).error)
+            " (client: " + client.id + "): " + resp.error)
         }
         const handle: NotificationHandle = {
-          id: (resp as JolokiaSuccessResponse).value as NotificationAddResponseValue,
+          id: resp.value as NotificationAddResponseValue,
           mode: mode
         }
         notificationHandlerFunc("add", mode)(this, handle, opts)
@@ -321,10 +325,10 @@ const Jolokia = function (this: IJolokia, config: JolokiaConfiguration | string)
         const resp = (responses as JolokiaSuccessResponse | JolokiaErrorResponse)
         if (Jolokia.isError(resp)) {
           throw new Error("Can not register client for notifications: "
-            + (resp as JolokiaErrorResponse).error
-            + "\nTrace:\n" + (resp as JolokiaErrorResponse).stacktrace)
+            + resp.error
+            + "\nTrace:\n" + resp.stacktrace)
         } else {
-          client = (resp as JolokiaSuccessResponse).value as NotificationClient
+          client = resp.value as NotificationClient
         }
         return true
       })
@@ -367,7 +371,7 @@ const Jolokia = function (this: IJolokia, config: JolokiaConfiguration | string)
         const job: Job = {
           callback: function (...resp) {
             if (resp.length > 0 && !Jolokia.isError(resp[0])) {
-              const notifs = (resp[0] as JolokiaSuccessResponse).value as NotificationPullValue
+              const notifs = resp[0].value as NotificationPullValue
               if (notifs && notifs.notifications && notifs.notifications.length > 0) {
                 opts?.callback?.(notifs)
               }
@@ -473,12 +477,13 @@ Object.defineProperty(Jolokia.prototype, "CLIENT_VERSION", {
 Jolokia.escape = Jolokia.prototype.escape = function (part: string): string {
   return encodeURIComponent(part.replace(/!/g, "!!").replace(/\//g, "!/"))
 }
+
 Jolokia.escapePost = Jolokia.prototype.escape = function (part: string): string {
   return part.replace(/!/g, "!!").replace(/\//g, "!/")
 }
 
-Jolokia.isError = Jolokia.prototype.isError = function (resp: JolokiaResponse): boolean {
-  return resp == null || resp.status !== 200
+Jolokia.isError = Jolokia.prototype.isError = function (resp: JolokiaResponse): resp is JolokiaErrorResponse {
+  return resp == null || resp.status != 200
 }
 
 // ++++++++++++++++++++++++++++++++++++++++++++++++++
@@ -556,18 +561,35 @@ function prepareRequest(request: JolokiaRequest | JolokiaRequest[], agentOptions
 
   let successCb = undefined
   let errorCb = undefined
+  let fetchErrorCb: FetchErrorCallback | undefined = undefined
 
   if ("success" in opts) {
-    // we won't be returning anything useful (return Promise<undefined>)
+    // we won't be returning anything useful (return Promise<undefined>) and the response will be
+    // delivered via the callback
     successCb = constructCallbackDispatcher(opts.success)
     errorCb = constructCallbackDispatcher(opts.error)
   }
   if ("error" in opts && !opts.success) {
-    errorCb = constructCallbackDispatcher(opts.error)
+    // response is ignored, only error callback is used. This also turns off meaningfull Promise return value
     successCb = constructCallbackDispatcher("ignore")
+    errorCb = constructCallbackDispatcher(opts.error)
   }
 
-  return { url, fetchOptions, dataType: opts.dataType, resolve: opts.resolve, successCb, errorCb }
+  // in both callback and promise mode we can have a global "fetch error handler"
+  if (!("fetchError" in opts)) {
+    // in promise mode however we don't provide a default handler
+    if (successCb && errorCb) {
+      fetchErrorCb = (_response: Response | null, reason: DOMException | TypeError | string | null) => {
+        console.warn(reason)
+      }
+    }
+  } else if (opts.fetchError === "ignore") {
+    fetchErrorCb = (_response: Response | null, _reason: DOMException | TypeError | string | null) => { }
+  } else {
+    fetchErrorCb = opts.fetchError
+  }
+
+  return { url, fetchOptions, dataType: opts.dataType, resolve: opts.resolve, successCb, errorCb, fetchErrorCb }
 }
 
 /**
@@ -576,18 +598,22 @@ function prepareRequest(request: JolokiaRequest | JolokiaRequest[], agentOptions
  */
 async function performRequest(args: RequestArguments):
   Promise<string | JolokiaSuccessResponse | JolokiaErrorResponse | (JolokiaSuccessResponse | JolokiaErrorResponse)[] | Response | undefined> {
-  const { url, fetchOptions, dataType, resolve, successCb, errorCb } = args
+  const { url, fetchOptions, dataType, resolve, successCb, errorCb, fetchErrorCb } = args
 
   if (successCb && errorCb) {
-    // callback mode - we'll handle the promise and caller will get a promise resolving to `undefined` after
-    // the callbacks are notified
+    // callback mode
+    // we'll handle the promise and caller will get a promise resolving to `undefined` after
+    // the callbacks are notified.
+    // (even if user didn't pass `error` callback, it was configured by `prepareRequest()`)
+    // user doesn't have to attach any .then() or .catch() like in promise mode and the returned promise
+    // can be ignored
     return fetch(url, fetchOptions)
       .then(async (response: Response): Promise<undefined> => {
-        if (response.status >= 400) {
-          // Jolokia sends its errors with HTTP 200, so any HTTP code >= 400 is actually an error.
-          // with xhr and JQuery we were using ajaxError param, but this time we have to use Promise's exceptions
-          // user can Promise.catch() the exception which will be actual Response object (the beauty of JavaScript)
-          throw response
+        if (response.status != 200) {
+          // Jolokia sends its errors with HTTP 200, so any other HTTP code (even redirect - 30x) is actually an error.
+          // with xhr and JQuery we were using ajaxError param, here we use fetchError callback
+          fetchErrorCb?.(response, response.statusText)
+          return undefined
         }
         const ct = response.headers.get("content-type")
         if (dataType === "text" || !ct || !(ct.startsWith("text/json") || ct.startsWith("application/json"))) {
@@ -601,34 +627,52 @@ async function performRequest(args: RequestArguments):
           for (let n = 0; n < responses.length; n++) {
             const resp = responses[n]
             if (Jolokia.isError(resp)) {
-              (errorCb as ErrorCallback)(resp as JolokiaErrorResponse, n)
+              (errorCb as ErrorCallback)(resp, n)
             } else {
-              (successCb as ResponseCallback)(resp as JolokiaSuccessResponse, n)
+              (successCb as ResponseCallback)(resp, n)
             }
           }
         }
       })
+      .catch(reason => {
+        // this is a fetch() error (more serious than HTTP != 200) - we have no `Response` object to pass, just
+        // an exception/reason
+        fetchErrorCb?.(null, reason)
+        return undefined
+      })
   } else {
+    // promise mode
     // return a promise to be handled by the caller - whatever the caller wants
     if (resolve === "response") {
-      // low level Response handling at caller's side
+      // low level Response handling - entirely at caller's side
       return fetch(url, fetchOptions)
     } else {
-      // Jolokia response handling at caller's side (no access to response headers, status, etc.)
-      return fetch(url, fetchOptions)
+      // Jolokia response handling at caller's side (no access to response headers, status, etc. for HTTP 200)
+      const promise = fetch(url, fetchOptions)
         .then(async (response: Response): Promise<string | JolokiaSuccessResponse | JolokiaErrorResponse | (JolokiaSuccessResponse | JolokiaErrorResponse)[] | Response> => {
-          if (response.status >= 400) {
-            throw response
-          }
           if (response.status != 200) {
-            return response
+            // all non-200 responses are thrown as exception to be handled in .catch()
+            throw response
           }
           const ct = response.headers.get("content-type")
           if (dataType === "text" || !ct || !(ct.startsWith("text/json") || ct.startsWith("application/json"))) {
-            return response.text()
+            return await response.text()
           }
           return await response.json()
         })
+      if (fetchErrorCb) {
+        // we handle serious fetch() exception for user's convenience
+        return promise.catch(error => {
+          if (error instanceof Response) {
+            fetchErrorCb(error, null)
+          } else {
+            fetchErrorCb(null, error)
+          }
+          return undefined
+        })
+      } else {
+        return promise
+      }
     }
   }
 }
@@ -731,22 +775,28 @@ function createJolokiaInvocation(jobs: Job[], agentOptions: JolokiaConfiguration
       }
     }
 
-    // POST body is created on each request
-    requestArguments.fetchOptions.body = JSON.stringify(requests)
+    if (requests.length > 0) {
+      // POST body is created on each request
+      requestArguments.fetchOptions.body = JSON.stringify(requests)
 
-    // callbacks are configured on each request
-    requestArguments.successCb = function (response: JolokiaSuccessResponse, index: number) {
-      successCbs[index](response, index)
-    }
-    requestArguments.errorCb = function (response: JolokiaErrorResponse, index: number) {
-      errorCbs[index](response, index)
-    }
+      // callbacks are configured on each request
+      requestArguments.successCb = function (response: JolokiaSuccessResponse, index: number) {
+        successCbs[index](response, index)
+      }
+      requestArguments.errorCb = function (response: JolokiaErrorResponse, index: number) {
+        errorCbs[index](response, index)
+      }
+      requestArguments.fetchErrorCb = function (response: Response | null, error: DOMException | TypeError | string | null) {
+        if (response) {
+          console.error("Problem executing registered jobs: ", response.status, response.statusText)
+        } else {
+          console.error("Problem executing registered jobs: ", error)
+        }
+      }
 
-    // we can now call remote Jolokia agent
-    performRequest(requestArguments)
-      .catch(e => {
-        console.error("Problem executing registered jobs: ", e.name, e.stack)
-      })
+      // we can now call remote Jolokia agent
+      performRequest(requestArguments)
+    }
   }
 }
 
@@ -1206,4 +1256,4 @@ function extractNotificationMode(client: NotificationClient, opts: NotificationO
 }
 
 export * from "./jolokia-types.js"
-export default Jolokia as IJolokia
+export default Jolokia as JolokiaStatic

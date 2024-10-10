@@ -143,12 +143,7 @@ $(document).ready(function () {
                 }
             }
             new Jolokia({ url: "bla" }).request(
-                { type: "version" },
-                $.extend(extraParams,
-                    {
-                        success: function (response) {
-                        },
-                    })
+                { type: "version" }
             ).catch(e => {
                 // e is https://developer.mozilla.org/en-US/docs/Web/API/Response
                 assert.equal(e.statusText, "Not Found", "Fetch exception");
@@ -261,7 +256,7 @@ $(document).ready(function () {
             let resp = await new Jolokia("/bla").request(
                 { type: "READ", mbean: "java.lang:type=Memory", attribute: "HeapMemoryUsage" },
                 {
-                    ajaxError: function (xhr) {
+                    fetchError: function (xhr) {
                         assert.equal(xhr.status, 404);
                     }
                 }
